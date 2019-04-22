@@ -106,8 +106,17 @@ namespace polar_race {
     return {};
   }
 
-  void Index::lossy_put(const IndexKey &key, const IndexValue &val) {
-    (*map)[key] = val;
+  std::optional<IndexValue> Index::lossy_put(const IndexKey &key, const IndexValue &val) {
+    auto it = map->find(key);
+
+    if(it != map->end()) {
+      auto original = it->second;
+      it->second = val;
+      return { original };
+    } else {
+      map->insert(std::make_pair(key, val));
+      return {};
+    }
   }
 
   void Index::persist() {
@@ -116,7 +125,7 @@ namespace polar_race {
 
   void Index::check_free_space() {
     if(file->get_segment_manager()->get_free_memory() < GROW_THRESHOLD) {
-      std::cout<<"Grow"<<std::endl;
+      // std::cout<<"Grow"<<std::endl;
       file->flush();
       delete file;
       bip::managed_mapped_file::grow(file_path.c_str(), GROW_CHUNK);
@@ -143,64 +152,56 @@ namespace polar_race {
   }
 
   std::pair<IndexKey, IndexValue> Store::append(std::pair<PolarString, PolarString> val) {
+    std::unique_lock space_lock(space_mut);
+    auto required = val.second.size();
+    auto it = free_space.lower_bound({ required, { -1, -1 }});
+
+    /*
+    for(const auto &inner : free_space)
+      std::cout<<"CurFree: "<<inner.second.second<<" [] "<<inner.first<<std::endl;
+    */
+
+    size_t target_file;
+    size_t target_offset;
+    if(it == free_space.end()) {
+      // We need a new file
+
+      ++file_counter;
+      target_file = file_counter;
+      target_offset = 0;
+
+      free_space.insert({ STORE_MAX_FILESIZE - required, { file_counter, required }});
+      // std::cout<<"Initial space: "<<required<<" [] "<<STORE_MAX_FILESIZE - required<<std::endl;
+    } else {
+      target_file = it->second.first;
+      target_offset = it->second.second;
+      // std::cout<<"Using space: "<<target_offset<<" [] "<<required<<std::endl;
+
+      auto left = it->first - required;
+      free_space.erase(it);
+      if(left != 0) {
+        auto new_offset = target_offset + required;
+
+        free_space.insert({ left, { target_file, new_offset }});
+      }
+    }
+
+    space_lock.unlock();
+
     std::unique_lock lock(fs_mut);
 
-    FILE* fd = get_fd(file_counter, offset);
+    FILE* fd = get_fd(target_file, target_offset);
 
     std::fwrite(val.second.data(), sizeof(char), val.second.size(), fd);
 
     IndexValue value = {
-      .file = file_counter,
-      .offset = offset,
+      .file = target_file,
+      .offset = target_offset,
       .len = val.second.size(),
     };
 
     auto result = std::make_pair(val.first, value);
 
-    offset += val.second.size();
-
-    if(offset > STORE_MAX_FILESIZE) {
-      offset = 0;
-      ++file_counter;
-      fclose(fd);
-      fd = get_fd(file_counter, offset);
-    }
-
-    std::fclose(fd);
-
-    return result;
-  }
-
-  template<typename C>
-  std::vector<std::pair<IndexKey, IndexValue>> Store::append(const C &vals) {
-    std::unique_lock lock(fs_mut);
-
-    FILE* fd = get_fd(file_counter, offset);
-    std::vector<std::pair<IndexKey, IndexValue>> result;
-    result.reserve(vals.size());
-
-    for(const auto &val : vals) {
-      // std::cout<<"[STORE] INSERT: "<<val.second<<std::endl;
-      std::fwrite(val.second.data(), sizeof(char), val.second.size(), fd);
-
-      IndexValue value = {
-        .file = file_counter,
-        .offset = offset,
-        .len = val.second.size(),
-      };
-
-      result.emplace_back(val.first, value);
-
-      offset += val.second.size();
-
-      if(offset > STORE_MAX_FILESIZE) {
-        offset = 0;
-        ++file_counter;
-        fclose(fd);
-        fd = get_fd(file_counter, offset);
-      }
-      // std::cout<<"[STORE] NOW OFFSET: "<<offset<<std::endl;
-    }
     std::fclose(fd);
 
     return result;
@@ -212,6 +213,12 @@ namespace polar_race {
     fread(result.data(), sizeof(char), loc.len, fd);
     fclose(fd);
     return result;
+  }
+
+  void Store::free_up(const std::vector<IndexValue> &locs) {
+    std::unique_lock space_lock(space_mut);
+    for(const auto &loc : locs)
+      free_space.insert({ loc.len, { loc.file, loc.offset }});
   }
 
   FILE* Store::get_fd(size_t file, size_t offset) {
@@ -282,17 +289,38 @@ namespace polar_race {
 
   template<typename C>
   void EngineRace::clear_queue(C *queue) {
-    // TODO: figure out why locking the read lock here causes a dead lock
     if(queue->size() == 0) return;
 
     std::unique_lock lock(read_lock);
 
     index.check_free_space();
 
-    for(auto &[k, v] : *queue)
-      index.lossy_put(k, v);
+    std::vector<std::pair<IndexKey, IndexValue>> waiting;
+    waiting.reserve(queue->size());
+
+    for(auto &[k, v] : *queue) {
+      bool flag = false;
+      for(auto &inner : waiting)
+        if(inner.first == k) {
+          inner.second = v;
+          flag = true;
+          break;
+        }
+
+      if(!flag) waiting.push_back({ k, v });
+    }
+
+    std::vector<IndexValue> freed;
+    for(auto &[k, v] : waiting) {
+      auto original = index.lossy_put(k, v);
+      if(original && !(*original == v)) freed.push_back(*original);
+    }
     index.persist();
 
     queue->clear();
+
+    lock.unlock();
+
+    store.free_up(freed);
   }
 }  // namespace polar_race

@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <thread>
 #include <chrono>
+#include <set>
+#include <unordered_map>
 #include "include/engine.h"
 
 #include <boost/interprocess/managed_mapped_file.hpp>
@@ -27,12 +29,12 @@ namespace polar_race {
   const size_t MAX_VAL_LEN = 10240;
 
   const auto JOURNAL_FILE = "JOURNAL";
-  const size_t JOURNAL_SIZE = 10;
+  const size_t JOURNAL_SIZE = 32;
 
   const auto INDEX_FILE = "INDEX";
 
   const auto STORE_DIRECTORY = "STORE";
-  const auto STORE_MAX_FILESIZE = 10000000; // 10M for now
+  const size_t STORE_MAX_FILESIZE = 10000000; // 10M for now
 
   const auto WRITER_WAIT_TIMEOUT = 1ms;
   const auto SYNC_WAIT_TIMEOUT = 100us;
@@ -61,6 +63,13 @@ namespace polar_race {
       return true;
     }
 
+    bool operator==(const IndexKey &ano) {
+      if(ano.len != len) return false;
+      for(int i = 0; i<len; ++i)
+        if(ano.key[i] != key[i]) return false;
+      return true;
+    }
+
     bool operator<(const IndexKey &ano) const {
       for(int i = 0; i<len && i<ano.len; ++i) {
         if(key[i] < ano.key[i]) return true;
@@ -75,6 +84,10 @@ namespace polar_race {
     size_t file;
     size_t offset;
     size_t len;
+
+    bool operator==(const IndexValue &ano) const {
+      return file == ano.file && offset == ano.offset && len == ano.len;
+    }
   };
 
   struct JournalEntry {
@@ -118,6 +131,7 @@ namespace polar_race {
   typedef bip::map<IndexKey, IndexValue, std::less<IndexKey>, index_map_type_alloc> index_map;
 
   class Index {
+    friend class EngineRace;
     public:
       explicit Index(const std::string& path) : file_path(path) {
         std::cout<<"Initializing index..."<<std::endl;
@@ -132,7 +146,7 @@ namespace polar_race {
         std::cout<<"Index obj dropped."<<std::endl;
       }
 
-      void lossy_put(const IndexKey &key, const IndexValue &val);
+      std::optional<IndexValue> lossy_put(const IndexKey &key, const IndexValue &val);
       void persist();
       void check_free_space();
       std::optional<IndexValue> get(const IndexKey &key);
@@ -150,29 +164,29 @@ namespace polar_race {
         for(auto &file : fs::directory_iterator(path)) {
           auto fn = file.path().filename();
           size_t integer = std::stoi(fn);
-          std::cout<<"File: "<<integer<<std::endl;
-          if(integer >= file_counter) {
+          if(integer > file_counter)
             file_counter = integer;
-            offset = fs::file_size(file.path());
-
-            std::cout<<"Offset: "<<offset<<std::endl;
-          }
         }
-
-        if(file_counter == -1) file_counter = 0;
       }
 
+      /*
       template<typename C>
       std::vector<std::pair<IndexKey, IndexValue>> append(const C &vals);
+      */
       std::pair<IndexKey, IndexValue> append(std::pair<PolarString, PolarString> val);
 
       std::string fetch(const IndexValue &loc);
+
+      void free_up(const std::vector<IndexValue> &locs);
     private:
       std::string basedir;
-      size_t file_counter = 0;
-      size_t offset = 0;
+      size_t file_counter = -1;
       FILE* get_fd(size_t file, size_t offset);
+
+      std::set<std::pair<size_t, std::pair<size_t, size_t>>> free_space;
+
       std::shared_mutex fs_mut;
+      std::shared_mutex space_mut;
   };
 
   class EngineRace : public Engine  {
@@ -180,6 +194,42 @@ namespace polar_race {
       static RetCode Open(const std::string& name, Engine** eptr);
 
       explicit EngineRace(const std::string& dir) : journal(dir+"/"+JOURNAL_FILE, JOURNAL_SIZE), index(dir+"/"+INDEX_FILE), store(dir+"/"+STORE_DIRECTORY) {
+        // Setup all freed space
+        std::unordered_map<size_t, std::set<std::pair<size_t, size_t>>> all_regions;
+
+        for(auto it = index.map->begin(); it != index.map->end(); ++it) {
+          const IndexValue &loc = it->second;
+          auto &s = all_regions[loc.file];
+
+          if(s.size() == 0) s.insert({ 0, STORE_MAX_FILESIZE });
+
+          auto target = s.upper_bound({ loc.offset, -1 });
+          assert(target != s.begin());
+          --target;
+
+          auto target_start = target->first;
+          auto target_len = target->second;
+
+          s.erase(target);
+
+          if(target_start != loc.offset)
+            s.insert({ target_start, loc.offset - target_start });
+          if(target_start + target_len != loc.offset + loc.len)
+            s.insert({ loc.offset + loc.len, target_start + target_len - loc.offset - loc.len });
+
+          assert(target_start + target_len >= loc.offset + loc.len);
+        }
+
+        std::vector<IndexValue> free_spots;
+
+        for(const auto &[file, inner] : all_regions)
+          for(const auto &[offset, len] : inner) {
+            free_spots.push_back(IndexValue { .file = file, .offset = offset, .len = len });
+            // std::cout<<"Free: "<<offset<<" [] "<<len<<std::endl;
+          }
+
+        store.free_up(free_spots);
+
         sync_worker = std::thread([this]() {
           auto lock = this->journal.lock();
 
