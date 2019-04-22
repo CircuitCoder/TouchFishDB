@@ -8,7 +8,8 @@ namespace polar_race {
   bool Journal::restore() {
     std::unique_lock<std::shared_mutex> lock(mut);
     std::fseek(fd, 0, SEEK_SET);
-    auto entries = new JournalEntry[max_size];
+    auto entries_mem = new char[sizeof(JournalEntry) * max_size];
+    auto entries = (JournalEntry*) entries_mem;
 
     size_t count = std::fread(entries, sizeof(JournalEntry), max_size, fd);
 
@@ -31,14 +32,14 @@ namespace polar_race {
       for(int i = 0; i<count; ++i) {
         const auto &ent = entries[i];
         // std::cout<<"Restored: "<<ent.ident<<" "<<PolarString(ent.key, ent.keylen).ToString()<<std::endl;
-        queue.push_back({ PolarString(ent.key, ent.keylen).ToString(), PolarString(ent.val, ent.vallen).ToString() });
+        queue.push_back(ent.pair);
       }
     } else {
       size_t iter = ent_counter;
       while(true) {
         const auto &ent = entries[iter];
         // std::cout<<"Restored: "<<ent.ident<<" "<<PolarString(ent.key, ent.keylen).ToString()<<std::endl;
-        queue.push_back({ PolarString(ent.key, ent.keylen).ToString(), PolarString(ent.val, ent.vallen).ToString() });
+        queue.push_back(ent.pair);
         ++iter;
         if(iter == max_size) iter = 0;
         if(iter == ent_counter) break;
@@ -56,7 +57,7 @@ namespace polar_race {
     return true;
   }
 
-  bool Journal::push(const PolarString &key, const PolarString &val) {
+  bool Journal::push(const std::pair<IndexKey, IndexValue> &pair) {
     // Journal is rarely full, so we are checking for that inside
     std::unique_lock<std::shared_mutex> lock(mut);
     while(queue.size() == max_size) {
@@ -64,14 +65,12 @@ namespace polar_race {
       notify_writers.wait_for(lock, WRITER_WAIT_TIMEOUT);
     }
 
-    queue.push_back({ key.ToString(), val.ToString() });
+    queue.push_back(pair);
 
-    JournalEntry ent;
-    ent.ident = ent_ident;
-    ent.keylen = key.size();
-    ent.vallen = val.size();
-    memcpy(ent.key, key.data(), key.size());
-    memcpy(ent.val, val.data(), val.size());
+    JournalEntry ent {
+      .ident = (size_t) ent_ident,
+      .pair = pair,
+    };
 
     if(++ent_ident == max_size + 1)
       ent_ident = 0;
@@ -88,7 +87,7 @@ namespace polar_race {
     return true;
   }
 
-  std::deque<std::pair<std::string, std::string>>* Journal::wait_data(std::unique_lock<std::shared_mutex> &lock) {
+  std::deque<std::pair<IndexKey, IndexValue>>* Journal::wait_data(std::unique_lock<std::shared_mutex> &lock) {
     notify_writers.notify_all();
     notify_sync.wait_for(lock, SYNC_WAIT_TIMEOUT);
     return &queue;
@@ -98,10 +97,10 @@ namespace polar_race {
     return std::unique_lock(mut);
   }
 
-  std::optional<std::string> Journal::fetch(const PolarString &key) {
+  std::optional<IndexValue> Journal::fetch(const PolarString &key) {
     std::shared_lock<std::shared_mutex> lock(mut);
     for(auto it = queue.rbegin(); it != queue.rend(); ++it)
-      if(it->first == key)
+      if(it->first.equals(key))
         return it->second;
 
     return {};
@@ -127,7 +126,7 @@ namespace polar_race {
 
   void Index::reload_file() {
     try {
-      auto size = std::filesystem::file_size(file_path.c_str());
+      auto size = std::experimental::filesystem::file_size(file_path.c_str());
       file = new bip::managed_mapped_file(bip::open_or_create, file_path.c_str(), size);
     } catch(...) {
       file = new bip::managed_mapped_file(bip::open_or_create, file_path.c_str(), 1048576);
@@ -143,8 +142,39 @@ namespace polar_race {
     return { it->second };
   }
 
+  std::pair<IndexKey, IndexValue> Store::append(std::pair<PolarString, PolarString> val) {
+    std::unique_lock lock(fs_mut);
+
+    FILE* fd = get_fd(file_counter, offset);
+
+    std::fwrite(val.second.data(), sizeof(char), val.second.size(), fd);
+
+    IndexValue value = {
+      .file = file_counter,
+      .offset = offset,
+      .len = val.second.size(),
+    };
+
+    auto result = std::make_pair(val.first, value);
+
+    offset += val.second.size();
+
+    if(offset > STORE_MAX_FILESIZE) {
+      offset = 0;
+      ++file_counter;
+      fclose(fd);
+      fd = get_fd(file_counter, offset);
+    }
+
+    std::fclose(fd);
+
+    return result;
+  }
+
   template<typename C>
   std::vector<std::pair<IndexKey, IndexValue>> Store::append(const C &vals) {
+    std::unique_lock lock(fs_mut);
+
     FILE* fd = get_fd(file_counter, offset);
     std::vector<std::pair<IndexKey, IndexValue>> result;
     result.reserve(vals.size());
@@ -204,7 +234,7 @@ namespace polar_race {
 
   // 1. Open engine
   RetCode EngineRace::Open(const std::string& name, Engine** eptr) {
-    std::filesystem::create_directory(name);
+    std::experimental::filesystem::create_directory(name);
     *eptr = NULL;
     EngineRace *engine_race = new EngineRace(name);
 
@@ -214,24 +244,21 @@ namespace polar_race {
 
   // 3. Write a key-value pair into engine
   RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
-    journal.push(key, value);
+    auto pair = store.append({ key, value });
+    journal.push(pair);
     return kSucc;
   }
 
   // 4. Read value of a key
   RetCode EngineRace::Read(const PolarString& key, std::string* value) {
-    auto result = journal.fetch(key);
+    auto loc = journal.fetch(key);
 
-    if(result) {
-      *value = *result;
-      return kSucc;
+    if(!loc) {
+      std::shared_lock lock(read_lock);
+      loc = { index.get(key) };
     }
 
-    std::shared_lock lock(read_lock);
-
-    auto loc = index.get(key);
     if(!loc) return kNotFound;
-    // std::cout<<"Found: "<<loc->file<<" -> "<<loc->offset<<" * "<<loc->len<<std::endl;
 
     *value = store.fetch(*loc);
     return kSucc;
@@ -257,14 +284,12 @@ namespace polar_race {
   void EngineRace::clear_queue(C *queue) {
     // TODO: figure out why locking the read lock here causes a dead lock
     if(queue->size() == 0) return;
-    // std::cout<<"Clearing queue..."<<std::endl;
-    auto locs = store.append(*queue);
 
     std::unique_lock lock(read_lock);
 
     index.check_free_space();
 
-    for(auto &[k, v] : locs)
+    for(auto &[k, v] : *queue)
       index.lossy_put(k, v);
     index.persist();
 

@@ -7,7 +7,7 @@
 #include <iostream>
 #include <deque>
 #include <cstdio>
-#include <filesystem>
+#include <experimental/filesystem>
 #include <optional>
 #include <condition_variable>
 #include <thread>
@@ -19,7 +19,7 @@
 #include <boost/interprocess/allocators/allocator.hpp>
 
 namespace bip = boost::interprocess;
-namespace fs = std::filesystem;
+namespace fs = std::experimental::filesystem;
 using namespace std::literals;
 
 namespace polar_race {
@@ -40,43 +40,6 @@ namespace polar_race {
   const auto GROW_THRESHOLD = 65536;
   const auto GROW_CHUNK = 65536 * 64;
 
-  struct JournalEntry {
-    size_t ident;
-    size_t keylen;
-    size_t vallen;
-
-    char key[MAX_KEY_LEN];
-    char val[MAX_VAL_LEN];
-  };
-
-  class Journal {
-    public:
-      explicit Journal(const std::string& path, size_t ms) : max_size(ms), ent_counter(0), ent_ident(0) {
-        fd = std::fopen(path.c_str(), "a+");
-        std::freopen(path.c_str(), "r+", fd);
-        restore();
-      }
-
-      ~Journal() {
-        fclose(fd);
-      }
-      bool restore();
-      bool push(const PolarString &key, const PolarString &val);
-      std::optional<std::string> fetch(const PolarString &key);
-      std::deque<std::pair<std::string, std::string>>* wait_data(std::unique_lock<std::shared_mutex> &lock);
-      std::unique_lock<std::shared_mutex> lock();
-    private:
-      std::deque<std::pair<std::string, std::string>> queue;
-      std::shared_mutex mut;
-      FILE* fd;
-      int ent_counter;
-      int ent_ident;
-      size_t max_size;
-
-      std::condition_variable_any notify_sync;
-      std::condition_variable_any notify_writers;
-  };
-
   struct IndexKey {
     size_t len;
     char key[MAX_KEY_LEN];
@@ -89,6 +52,13 @@ namespace polar_race {
     IndexKey(const std::string &s) {
       len = s.size();
       memcpy(key, s.data(), len);
+    }
+
+    bool equals(const PolarString &ano) {
+      if(ano.size() != len) return false;
+      for(int i = 0; i<len; ++i)
+        if(ano.data()[i] != key[i]) return false;
+      return true;
     }
 
     bool operator<(const IndexKey &ano) const {
@@ -105,6 +75,39 @@ namespace polar_race {
     size_t file;
     size_t offset;
     size_t len;
+  };
+
+  struct JournalEntry {
+    size_t ident;
+    std::pair<IndexKey, IndexValue> pair;
+  };
+
+  class Journal {
+    public:
+      explicit Journal(const std::string& path, size_t ms) : max_size(ms), ent_counter(0), ent_ident(0) {
+        fd = std::fopen(path.c_str(), "a+");
+        std::freopen(path.c_str(), "r+", fd);
+        restore();
+      }
+
+      ~Journal() {
+        fclose(fd);
+      }
+      bool restore();
+      bool push(const std::pair<IndexKey, IndexValue> &pair);
+      std::optional<IndexValue> fetch(const PolarString &key);
+      std::deque<std::pair<IndexKey, IndexValue>>* wait_data(std::unique_lock<std::shared_mutex> &lock);
+      std::unique_lock<std::shared_mutex> lock();
+    private:
+      std::deque<std::pair<IndexKey, IndexValue>> queue;
+      std::shared_mutex mut;
+      FILE* fd;
+      int ent_counter;
+      int ent_ident;
+      size_t max_size;
+
+      std::condition_variable_any notify_sync;
+      std::condition_variable_any notify_writers;
   };
 
   typedef bip::managed_mapped_file::segment_manager seg_manager;
@@ -150,7 +153,7 @@ namespace polar_race {
           std::cout<<"File: "<<integer<<std::endl;
           if(integer >= file_counter) {
             file_counter = integer;
-            offset = file.file_size();
+            offset = fs::file_size(file.path());
 
             std::cout<<"Offset: "<<offset<<std::endl;
           }
@@ -161,12 +164,15 @@ namespace polar_race {
 
       template<typename C>
       std::vector<std::pair<IndexKey, IndexValue>> append(const C &vals);
+      std::pair<IndexKey, IndexValue> append(std::pair<PolarString, PolarString> val);
+
       std::string fetch(const IndexValue &loc);
     private:
       std::string basedir;
       size_t file_counter = 0;
       size_t offset = 0;
       FILE* get_fd(size_t file, size_t offset);
+      std::shared_mutex fs_mut;
   };
 
   class EngineRace : public Engine  {
