@@ -24,10 +24,11 @@ using namespace std::literals;
 
 namespace polar_race {
   const size_t MAX_KEY_LEN = 2048;
-  const size_t MAX_VAL_LEN = 10240;
+  const size_t MAX_VAL_LEN = 5120000;
 
   const auto JOURNAL_FILE = "JOURNAL";
-  const size_t JOURNAL_SIZE = 10;
+  const size_t JOURNAL_SIZE = 128;
+  const size_t JOURNAL_BACKOFF = 16;
 
   const auto INDEX_FILE = "INDEX";
 
@@ -37,8 +38,9 @@ namespace polar_race {
   const auto WRITER_WAIT_TIMEOUT = 1ms;
   const auto SYNC_WAIT_TIMEOUT = 100us;
 
-  const auto GROW_THRESHOLD = 65536;
-  const auto GROW_CHUNK = 65536 * 64;
+  const auto GROW_THRESHOLD = 65536 * 16;
+  const auto GROW_CHUNK = 65536 * 256;
+  const auto INDEX_INITIAL_CHUNK = 4;
 
   struct IndexKey {
     size_t len;

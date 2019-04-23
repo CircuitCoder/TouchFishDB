@@ -60,9 +60,14 @@ namespace polar_race {
   bool Journal::push(const std::pair<IndexKey, IndexValue> &pair) {
     // Journal is rarely full, so we are checking for that inside
     std::unique_lock<std::shared_mutex> lock(mut);
-    while(queue.size() == max_size) {
+    while(queue.size() >= max_size - JOURNAL_BACKOFF) {
       notify_sync.notify_one();
-      notify_writers.wait_for(lock, WRITER_WAIT_TIMEOUT);
+
+      if(queue.size() == max_size) {
+        notify_writers.wait_for(lock, WRITER_WAIT_TIMEOUT);
+      } else {
+        break;
+      }
     }
 
     queue.push_back(pair);
@@ -116,7 +121,7 @@ namespace polar_race {
 
   void Index::check_free_space() {
     if(file->get_segment_manager()->get_free_memory() < GROW_THRESHOLD) {
-      std::cout<<"Grow"<<std::endl;
+      // std::cout<<"Grow"<<std::endl;
       file->flush();
       delete file;
       bip::managed_mapped_file::grow(file_path.c_str(), GROW_CHUNK);
@@ -129,7 +134,7 @@ namespace polar_race {
       auto size = std::experimental::filesystem::file_size(file_path.c_str());
       file = new bip::managed_mapped_file(bip::open_or_create, file_path.c_str(), size);
     } catch(...) {
-      file = new bip::managed_mapped_file(bip::open_or_create, file_path.c_str(), 1048576);
+      file = new bip::managed_mapped_file(bip::open_or_create, file_path.c_str(), GROW_CHUNK * INDEX_INITIAL_CHUNK);
     }
 
     void_alloc alloc(file->get_segment_manager());
