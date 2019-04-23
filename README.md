@@ -5,7 +5,7 @@
 `摸鱼 DB` 是一个摸鱼的 KV 数据存储。能够确保原子性以及 Crash consistency, 使用了 Write-ahead logging。
 
 Repo 中共有三个 Branch:
-- master: 提交的版本
+- master: 提交的版本，包括 Range query
 - no\_journaling: 禁用 Journal 的版本
 - with\_free\_space: 复用失效数据空间的版本
 
@@ -151,7 +151,7 @@ sync 循环做的事情是：
 ##### Index
 Read 和 Sync 会涉及 Index。这个好像没有什么特别好的优化办法，直接加了一个锁在 Index 操作周围。
 
-之前是在整个 Read 外面加的的这个锁，把 Journal 的读取包进去了，因此这个 Mutex 在代码中叫做 `read_mut`
+之前是在整个 Read 外面加的的这个锁，把 Journal 的读取包进去了，因此这个 Mutex 在代码中叫做 `read_lock`
 
 这样可能会和 Sync 死锁:
 
@@ -208,3 +208,12 @@ JOURNAL_BACKOFF === JOURNAL_SIZE / 4
 
 在测试过程中，我们注意到进程的 M_RES 内存在 700MB - 1200MB 之间浮动，而 M_VIRT 不断上升，说明 Swap 可能对测试的效果产生了不可忽略的影响。尤其是在禁用 Journal 之后，需要对 mmap 区域地 sync，可能是 Swap 带来的一次额外的读硬盘造成了延迟。理想而言作为对比，应该在有大于 4G 空闲内存的计算机上再进行一次测试，但是我没有内存足够大的，而且是在运行真实 Linux 内核的计算机，因此这个测试无法进行。
 
+## 思考题
+
+如何验证/测试 KV 引擎的 Crash consistency?
+
+直接 SIGKILL 是不太行的，操作系统会做一些善后工作，比如把 mmap 空间里的东西写进去。
+
+一个可能的比较简单的方法是 FUSE 写个文件系统，把每个状态保留下来，然后再尝试复现之前的状态。可以通过随机采样，或者也可以造一些容易出问题的情况，比如多次并发写入之后立即进行一次采样。这样可以不断电模拟只有硬盘上的数据保留的情况。
+
+如果担心 FUSE 的实现和真实硬盘的实现不完全一样，可以抓 SYSCALL，把所有的 write 留下来，可以在其他文件系统上达到类似的效果。

@@ -98,8 +98,16 @@ namespace polar_race {
     return &queue;
   }
 
+  std::deque<std::pair<IndexKey, IndexValue>>* Journal::data() {
+    return &queue;
+  }
+
   std::unique_lock<std::shared_mutex> Journal::lock() {
     return std::unique_lock(mut);
+  }
+
+  std::shared_lock<std::shared_mutex> Journal::shared_lock() {
+    return std::shared_lock(mut);
   }
 
   std::optional<IndexValue> Journal::fetch(const PolarString &key) {
@@ -282,6 +290,46 @@ namespace polar_race {
   //   Range("", "", visitor)
   RetCode EngineRace::Range(const PolarString& lower, const PolarString& upper,
       Visitor &visitor) {
+    std::map<IndexKey, IndexValue> pending;
+    auto journal_lock = journal.shared_lock();
+
+    auto data = journal.data();
+    for(const auto &pair : *data)
+      pending[pair.first] = pair.second;
+
+    journal_lock.unlock();
+
+    std::shared_lock lock(read_lock);
+
+    auto it = lower.size() == 0 ? index.map->begin() : index.map->lower_bound(lower);
+    auto end = upper.size() == 0 ? index.map->end() : index.map->upper_bound(upper);
+
+    auto pit = pending.begin();
+    auto pend = pending.end();
+
+    while(it != end) {
+      while(pit != pend && pit->first < it->first) {
+        visitor.Visit(pit->first, store.fetch(pit->second));
+        ++pit;
+      }
+
+      while(pit != pend && it != end && pit->first == it->first) {
+        visitor.Visit(pit->first, store.fetch(pit->second));
+        ++it;
+        ++pit;
+      }
+
+      if(it == end) break;
+
+      visitor.Visit(it->first, store.fetch(it->second));
+      ++it;
+    }
+
+    while(pit != pend) {
+      visitor.Visit(it->first, store.fetch(pit->second));
+      ++pit;
+    }
+
     return kSucc;
   }
 

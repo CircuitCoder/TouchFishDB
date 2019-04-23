@@ -71,6 +71,10 @@ namespace polar_race {
 
       return len < ano.len;
     }
+
+    operator PolarString() const {
+      return PolarString(key, len);
+    }
   };
 
   struct IndexValue {
@@ -99,7 +103,9 @@ namespace polar_race {
       bool push(const std::pair<IndexKey, IndexValue> &pair);
       std::optional<IndexValue> fetch(const PolarString &key);
       std::deque<std::pair<IndexKey, IndexValue>>* wait_data(std::unique_lock<std::shared_mutex> &lock);
+      std::deque<std::pair<IndexKey, IndexValue>>* data();
       std::unique_lock<std::shared_mutex> lock();
+      std::shared_lock<std::shared_mutex> shared_lock();
     private:
       std::deque<std::pair<IndexKey, IndexValue>> queue;
       std::shared_mutex mut;
@@ -120,6 +126,7 @@ namespace polar_race {
   typedef bip::map<IndexKey, IndexValue, std::less<IndexKey>, index_map_type_alloc> index_map;
 
   class Index {
+    friend class EngineRace;
     public:
       explicit Index(const std::string& path) : file_path(path) {
         std::cout<<"Initializing index..."<<std::endl;
