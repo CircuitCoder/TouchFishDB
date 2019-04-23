@@ -182,6 +182,7 @@ namespace polar_race {
       static RetCode Open(const std::string& name, Engine** eptr);
 
       explicit EngineRace(const std::string& dir) : journal(dir+"/"+JOURNAL_FILE, JOURNAL_SIZE), index(dir+"/"+INDEX_FILE), store(dir+"/"+STORE_DIRECTORY) {
+        /*
         sync_worker = std::thread([this]() {
           auto lock = this->journal.lock();
 
@@ -193,11 +194,12 @@ namespace polar_race {
             }
           }
         });
+        */
       }
 
       ~EngineRace() {
         halt = true;
-        sync_worker.join();
+        // sync_worker.join();
       }
 
       RetCode Write(const PolarString& key,

@@ -148,8 +148,6 @@ namespace polar_race {
   }
 
   std::pair<IndexKey, IndexValue> Store::append(std::pair<PolarString, PolarString> val) {
-    std::unique_lock lock(fs_mut);
-
     FILE* fd = get_fd(file_counter, offset);
 
     std::fwrite(val.second.data(), sizeof(char), val.second.size(), fd);
@@ -249,20 +247,20 @@ namespace polar_race {
 
   // 3. Write a key-value pair into engine
   RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
-    auto pair = store.append({ key, value });
-    journal.push(pair);
+    std::unique_lock lock(read_lock);
+    auto [k, v] = store.append({ key, value });
+    index.check_free_space();
+    index.lossy_put(k, v);
+    index.persist();
     return kSucc;
   }
 
   // 4. Read value of a key
   RetCode EngineRace::Read(const PolarString& key, std::string* value) {
-    auto loc = journal.fetch(key);
 
-    if(!loc) {
-      std::shared_lock lock(read_lock);
-      loc = { index.get(key) };
-    }
-
+    std::shared_lock lock(read_lock);
+    auto loc = index.get(key);
+    lock.unlock();
     if(!loc) return kNotFound;
 
     *value = store.fetch(*loc);
