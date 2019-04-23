@@ -4,6 +4,11 @@
 
 `摸鱼 DB` 是一个摸鱼的 KV 数据存储。能够确保原子性以及 Crash consistency, 使用了 Write-ahead logging。
 
+Repo 中共有三个 Branch:
+- master: 提交的版本
+- no\_journaling: 禁用 Journal 的版本
+- with\_free\_space: 复用失效数据空间的版本
+
 ## 设计
 包含三部份：
 - Journal, 处理 Write-ahead logging
